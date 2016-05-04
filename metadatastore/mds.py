@@ -14,12 +14,20 @@ _API_MAP = {0: core_v0,
 
 class MDSRO(object):
     def __init__(self, config, version=1):
-        self._RUNSTART_CACHE = boltons.cacheutils.LRU(max_size=1000)
-        self._RUNSTOP_CACHE = boltons.cacheutils.LRU(max_size=1000)
-        self._DESCRIPTOR_CACHE = boltons.cacheutils.LRU(max_size=1000)
-
+        self._RUNSTART_CACHE = {}
+        self._RUNSTOP_CACHE = {}
+        self._DESCRIPTOR_CACHE = {}
+        self.reset_connection()
         self.config = config
+        self._api = None
+        self.version = version
 
+    def reset_caches(self):
+        self._RUNSTART_CAHCE.clear()
+        self._RUNSTOP_CAHCE.clear()
+        self._DESCRIPTOR_CAHCE.clear()
+
+    def reset_connection(self):
         self.__conn = None
 
         self.__db = None
@@ -28,8 +36,17 @@ class MDSRO(object):
         self.__descriptor_col = None
         self.__runstart_col = None
         self.__runstop_col = None
+
+    def __getstate__(self):
+        return self.version, self.config
+
+    def __setstate__(self, state):
+        self._RUNSTART_CACHE = {}
+        self._RUNSTOP_CACHE = {}
+        self._DESCRIPTOR_CACHE = {}
+        self.reset_connection()
         self._api = None
-        self.version = version
+        self.version, self.config = state
 
     @property
     def version(self):
@@ -81,6 +98,7 @@ class MDSRO(object):
             self.__runstart_col.create_index([('time', pymongo.DESCENDING),
                                               ('scan_id', pymongo.DESCENDING)],
                                              unique=False, background=True)
+            self.__runstart_col.create_index([("$**", "text")])
 
         return self.__runstart_col
 
@@ -94,20 +112,32 @@ class MDSRO(object):
                                             unique=True)
             self.__runstop_col.create_index([('time', pymongo.DESCENDING)],
                                             unique=False, background=True)
+            self.__runstop_col.create_index([("$**", "text")])
 
         return self.__runstop_col
 
     @property
     def _descriptor_col(self):
         if self.__descriptor_col is None:
+            # The name of the reference to the run start changed from
+            # 'run_start_id' in v0 to 'run_start' in v1.
+            if self.version == 1:
+                rs_name = 'run_start'
+            elif self.version == 0:
+                rs_name = 'run_start_id'
+            else:
+                raise RuntimeError("No rule for event index creation for "
+                                   " schema version {!r}".format(self.version))
             self.__descriptor_col = self._db.get_collection('event_descriptor')
 
             self.__descriptor_col.create_index([('uid', pymongo.DESCENDING)],
                                                unique=True)
-            self.__descriptor_col.create_index(
-                [('run_start', pymongo.DESCENDING),
-                 ('time', pymongo.DESCENDING)],
-                unique=False, background=True)
+            self.__descriptor_col.create_index([(rs_name, pymongo.DESCENDING),
+                                                ('time', pymongo.DESCENDING)],
+                                               unique=False, background=True)
+            self.__descriptor_col.create_index([('time', pymongo.DESCENDING)],
+                                               unique=False, background=True)
+            self.__descriptor_col.create_index([("$**", "text")])
 
         return self.__descriptor_col
 
@@ -118,10 +148,18 @@ class MDSRO(object):
 
             self.__event_col.create_index([('uid', pymongo.DESCENDING)],
                                           unique=True)
-            self.__event_col.create_index([('descriptor', pymongo.DESCENDING),
-                                           ('time', pymongo.DESCENDING)],
-                                          unique=False, background=True)
-
+            if self.version == 1:
+                self.__event_col.create_index([('descriptor', pymongo.DESCENDING),
+                                               ('time', pymongo.ASCENDING)],
+                                              unique=False, background=True)
+            elif self.version == 0:
+                self.__event_col.create_index([('descriptor_id',
+                                                pymongo.DESCENDING),
+                                               ('time', pymongo.ASCENDING)],
+                                              unique=False, background=True)
+            else:
+                raise RuntimeError("No rule for event index creation for "
+                                   " schema version {!r}".format(self.version))
         return self.__event_col
 
     def clear_process_cache(self):
@@ -260,7 +298,7 @@ class MDSRO(object):
                                               self._runstart_col,
                                               self._RUNSTART_CACHE)
 
-    def get_events_generator(self, descriptor):
+    def get_events_generator(self, descriptor, convert_arrays=True):
         """A generator which yields all events from the event stream
 
         Parameters
@@ -268,6 +306,8 @@ class MDSRO(object):
         descriptor : doc.Document or dict or str
             The EventDescriptor to get the Events for.  Can be either
             a Document/dict with a 'uid' key or a uid string
+        convert_arrays : boolean
+            convert 'array' type to numpy.ndarray; True by default
 
         Yields
         ------
@@ -280,7 +320,8 @@ class MDSRO(object):
                                              self._descriptor_col,
                                              self._DESCRIPTOR_CACHE,
                                              self._runstart_col,
-                                             self._RUNSTART_CACHE)
+                                             self._RUNSTART_CACHE,
+                                             convert_arrays=convert_arrays)
 
         # when we drop 2.7, this can be
         # yield from evs
@@ -501,8 +542,13 @@ class MDSRO(object):
 
 
 class MDS(MDSRO):
-    def insert_run_start(self, time, scan_id, beamline_id, uid,
-                         owner='', group='', project='', **kwargs):
+    _INS_METHODS = {'start': 'insert_run_start',
+                    'stop': 'insert_run_stop',
+                    'descriptor': 'insert_descriptor',
+                    'event': 'insert_event',
+                    'bulk_events': 'bulk_insert_events'}
+
+    def insert_run_start(self, time, uid, **kwargs):
         '''Insert a Start document
 
         All extra keyword arguments are passed through to the database
@@ -512,19 +558,20 @@ class MDS(MDSRO):
         ----------
         time : float
             The date/time as found at the client side when the run is started
-        scan_id : int
-            Scan identifier visible to the user and data analysis.  This is not
-            a unique identifier.
-        beamline_id : str
-            Beamline String identifier.
         uid : str
             Globally unique id to identify this RunStart
+        scan_id : int, optional
+            Scan identifier visible to the user and data analysis.  This is not
+            a unique identifier.
         owner : str, optional
             A username associated with the RunStart
         group : str, optional
             An experimental group associated with the RunStart
         project : str, optional
             Any project name to help users locate the data
+        sample : str or dict, optional
+        kwargs
+            passed through
 
         Returns
         -------
@@ -536,12 +583,8 @@ class MDS(MDSRO):
             raise NotImplementedError("Can not create documents of v0 schema")
         return core.insert_run_start(self._runstart_col,
                                      self._RUNSTART_CACHE,
-                                     time, scan_id=scan_id,
-                                     beamline_id=beamline_id,
+                                     time=time,
                                      uid=uid,
-                                     owner=owner,
-                                     group=group,
-                                     project=project,
                                      **kwargs)
 
     def insert_run_stop(self, run_start, time, uid, exit_status='success',
@@ -655,10 +698,20 @@ class MDS(MDSRO):
                                  uid=uid,
                                  validate=validate)
 
-    def bulk_insert_events(self, descriptor, events, validate):
+    def bulk_insert_events(self, descriptor, events, validate=False):
         if self.version == 0:
             raise NotImplementedError("Can not create documents of v0 schema")
         return core.bulk_insert_events(self._event_col,
                                        descriptor=descriptor,
                                        events=events,
                                        validate=validate)
+
+    def insert(self, name, doc):
+        if name != 'bulk_events':
+            getattr(self, self._INS_METHODS[name])(**doc)
+        else:
+            for desc_uid, events in doc.items():
+                # If events is empty, mongo chokes.
+                if not events:
+                    continue
+                self.bulk_insert_events(desc_uid, events)

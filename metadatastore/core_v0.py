@@ -11,7 +11,7 @@ import logging
 import pytz
 
 import numpy as np
-
+import pymongo
 import doct as doc
 
 from .core import NoRunStop, NoEventDescriptors
@@ -326,7 +326,8 @@ def descriptors_by_start(run_start, descriptor_col, descriptor_cache,
     run_start = run_start_given_uid(run_start_uid, run_start_col,
                                     run_start_cache)
     oid = _UID_TO_OID_MAP[run_start_uid]
-    descriptors = descriptor_col.find({'run_start_id': oid})
+    descriptors = descriptor_col.find({'run_start_id': oid},
+                                      sort=[('time', pymongo.ASCENDING)])
 
     # loop over the found documents, cache, and dereference
     rets = [_cache_descriptor(descriptor, descriptor_cache,
@@ -344,7 +345,7 @@ def descriptors_by_start(run_start, descriptor_col, descriptor_cache,
 
 def get_events_generator(descriptor, event_col, descriptor_col,
                          descriptor_cache, run_start_col,
-                         run_start_cache):
+                         run_start_cache, convert_arrays=True):
     """A generator which yields all events from the event stream
 
     Parameters
@@ -352,6 +353,8 @@ def get_events_generator(descriptor, event_col, descriptor_col,
     descriptor : doc.Document or dict or str
         The EventDescriptor to get the Events for.  Can be either
         a Document/dict with a 'uid' key or a uid string
+    convert_arrays : boolean, optional
+        convert 'array' type to numpy.ndarray; True by default
 
     Yields
     ------
@@ -365,7 +368,9 @@ def get_events_generator(descriptor, event_col, descriptor_col,
                                       run_start_cache)
     col = event_col
     oid = _UID_TO_OID_MAP[descriptor_uid]
-    ev_cur = col.find({'descriptor_id': oid}, sort=[('time', 1)])
+    ev_cur = col.find({'descriptor_id': oid},
+                      sort=[('descriptor_id', pymongo.DESCENDING),
+                            ('time', pymongo.ASCENDING)])
 
     data_keys = descriptor['data_keys']
     for ev in ev_cur:
@@ -381,8 +386,9 @@ def get_events_generator(descriptor, event_col, descriptor_col,
         for k, v in ev['data'].items():
             _dk = data_keys[k]
             # convert any arrays stored directly in mds into ndarray
-            if _dk['dtype'] == 'array' and not _dk.get('external', False):
-                ev['data'][k] = np.asarray(ev['data'][k])
+            if convert_arrays:
+                if _dk['dtype'] == 'array' and not _dk.get('external', False):
+                    ev['data'][k] = np.asarray(ev['data'][k])
         # wrap it in our fancy dict
         ev = doc.Document('Event', ev)
 
@@ -569,9 +575,11 @@ def insert_run_stop(run_start_col, run_start_cache,
         raise RuntimeError("Runstop already exits for {!r}".format(run_start))
 
     col = run_stop_col
-    run_stop = dict(run_start=run_start_uid, reason=reason, time=time,
+    run_stop = dict(run_start=run_start_uid, time=time,
                     uid=uid,
                     exit_status=exit_status, **kwargs)
+    if reason is not None and reason != '':
+        run_stop['reason'] = reason
 
     col.insert_one(run_stop)
     _cache_run_stop(run_stop, run_stop_cache, run_start_col, run_start_cache)
@@ -885,7 +893,8 @@ def find_run_starts(run_start_col, run_start_cache, tz, **kwargs):
     """
     # now try rest of formatting
     _format_time(kwargs, tz)
-    rs_objects = run_start_col.find(kwargs)
+    rs_objects = run_start_col.find(kwargs,
+                                    sort=[('time', pymongo.DESCENDING)])
 
     for rs in rs_objects:
         yield _cache_run_start(rs, run_start_cache)
@@ -934,7 +943,8 @@ def find_run_stops(start_col, start_cache,
 
     _format_time(kwargs, tz)
     col = stop_col
-    run_stop = col.find(kwargs)
+    run_stop = col.find(kwargs,
+                        sort=[('time', pymongo.ASCENDING)])
 
     for rs in run_stop:
         yield _cache_run_stop(rs, stop_cache, start_col, start_cache)
@@ -977,7 +987,8 @@ def find_descriptors(start_col, start_cache,
     _format_time(kwargs, tz)
 
     col = descriptor_col
-    event_descriptor_objects = col.find(kwargs)
+    event_descriptor_objects = col.find(kwargs,
+                                        sort=[('time', pymongo.ASCENDING)])
 
     for event_descriptor in event_descriptor_objects:
         yield _cache_descriptor(event_descriptor, descriptor_cache,
@@ -1026,7 +1037,9 @@ def find_events(start_col, start_cache,
 
     _format_time(kwargs, tz)
     col = event_col
-    events = col.find(kwargs)
+    events = col.find(kwargs,
+                      sort=[('descriptor_id', pymongo.DESCENDING),
+                            ('time', pymongo.ASCENDING)])
 
     for ev in events:
         ev.pop('_id', None)

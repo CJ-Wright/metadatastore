@@ -163,7 +163,7 @@ def descriptors_by_start(run_start):
     return _DB_SINGLETON.descriptors_by_start(run_start)
 
 
-def get_events_generator(descriptor):
+def get_events_generator(descriptor, convert_arrays=True):
     """A generator which yields all events from the event stream
 
     Parameters
@@ -171,6 +171,8 @@ def get_events_generator(descriptor):
     descriptor : doc.Document or dict or str
         The EventDescriptor to get the Events for.  Can be either
         a Document/dict with a 'uid' key or a uid string
+    convert_arrays : boolean
+        convert 'array' type to numpy.ndarray; True by default
 
     Yields
     ------
@@ -178,7 +180,8 @@ def get_events_generator(descriptor):
         All events for the given EventDescriptor from oldest to
         newest
     """
-    for ev in _DB_SINGLETON.get_events_generator(descriptor):
+    for ev in _DB_SINGLETON.get_events_generator(
+            descriptor, convert_arrays=convert_arrays):
         yield ev
 
 
@@ -212,27 +215,47 @@ def get_events_table(descriptor):
 
 # database INSERTION ###################################################
 
-def insert_run_start(time, scan_id, beamline_id, uid, owner='', group='',
-                     project='', **kwargs):
+
+def insert(name, doc):
+    """
+    Insert a document or bulk event documents.
+
+    Dispatches to the other insert functions.
+
+    Parameters
+    ----------
+    name : {'start', 'stop', 'event', 'descriptor', 'bulk_events'}
+    doc : dict-like
+        either a document or, for bulk events, a dict mapping descriptor
+        uids to lists of event documents
+
+    Returns
+    -------
+    result : str or dict
+        See docstrings of other ``insert_*`` functions.
+    """
+    return _DB_SINGLETON.insert(name, doc)
+
+
+def insert_run_start(time, uid, **kwargs):
     """Insert a RunStart document into the database.
 
     Parameters
     ----------
     time : float
         The date/time as found at the client side when the run is started
-    scan_id : int
-        Scan identifier visible to the user and data analysis.  This is not
-        a unique identifier.
-    beamline_id : str
-        Beamline String identifier.
     uid : str
         Globally unique id to identify this RunStart
+    scan_id : int, optional
+        Scan identifier visible to the user and data analysis.  This is not
+        a unique identifier.
     owner : str, optional
         A username associated with the RunStart
     group : str, optional
         An experimental group associated with the RunStart
     project : str, optional
         Any project name to help users locate the data
+    sample : str or dict, optional
 
     Returns
     -------
@@ -241,10 +264,7 @@ def insert_run_start(time, scan_id, beamline_id, uid, owner='', group='',
         the full document.
 
     """
-    return _DB_SINGLETON.insert_run_start(time=time, scan_id=scan_id,
-                                          beamline_id=beamline_id, uid=uid,
-                                          owner=owner, group=group,
-                                          project=project, **kwargs)
+    return _DB_SINGLETON.insert_run_start(time=time, uid=uid, **kwargs)
 
 
 def insert_run_stop(run_start, time, uid, exit_status='success', reason='',
@@ -383,8 +403,6 @@ def find_run_starts(**kwargs):
     stop_time : time-like, optional
         timestamp of the latest time that a RunStart was created. See
         docs for `start_time` for examples.
-    beamline_id : str, optional
-        String identifier for a specific beamline
     project : str, optional
         Project name
     owner : str, optional
